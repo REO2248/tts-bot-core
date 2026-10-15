@@ -1,23 +1,33 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use reqwest::{
     Url,
     header::{HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use ssml::Serialize as SsmlSerialize;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{debug, warn};
 use tungstenite::client::IntoClientRequest;
 use uuid::Uuid;
 
-#[allow(clippy::unreadable_literal)]
-const WIN_EPOCH: u64 = 11644473600;
-const TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-const SEC_MS_GEC_VERSION: &str = "1-130.0.2849.68";
+use super::sec_ms_gec::{self, SEC_MS_GEC_VERSION, TRUSTED_CLIENT_TOKEN};
+
 const BING_SPEECH_MAX_CHARS: usize = 1000;
+
+/// Truncate payloads so log lines stay readable.
+fn preview(value: &str) -> String {
+    const LIMIT: usize = 200;
+
+    let head: String = value.chars().take(LIMIT).collect();
+    if value.chars().nth(LIMIT).is_some() {
+        format!("{head}… ({} bytes total)", value.len())
+    } else {
+        head
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
@@ -30,20 +40,11 @@ pub struct Voice {
 }
 
 fn generate_sec_ms_gec() -> String {
-    let start = SystemTime::now();
-    let since_the_epoch = start
+    let since_the_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards");
 
-    let mut ticks = since_the_epoch.as_secs();
-    ticks += WIN_EPOCH;
-    ticks -= ticks % 300;
-    let ticks_100ns = u128::from(ticks) * 10_000_000;
-
-    let str_to_hash = format!("{ticks_100ns}{TRUSTED_CLIENT_TOKEN}");
-    let mut hasher = Sha256::new();
-    hasher.update(str_to_hash);
-    hex::encode(hasher.finalize()).to_uppercase()
+    sec_ms_gec::generate(since_the_epoch.as_secs())
 }
 
 pub fn edgenize(headers: &mut HeaderMap) {
@@ -79,6 +80,7 @@ pub fn edgenize(headers: &mut HeaderMap) {
 }
 
 pub async fn list_voices() -> Result<Vec<Voice>> {
+    let started = Instant::now();
     let url = format!(
         "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken={}&Sec-MS-GEC={}&Sec-MS-GEC-Version={}",
         TRUSTED_CLIENT_TOKEN,
@@ -86,12 +88,42 @@ pub async fn list_voices() -> Result<Vec<Voice>> {
         SEC_MS_GEC_VERSION
     );
 
+    debug!(url, "bing speech: requesting voice list");
+
     let mut headers = HeaderMap::new();
     edgenize(&mut headers);
 
     let client = reqwest::Client::new();
-    let resp = client.get(&url).headers(headers).send().await?;
-    Ok(resp.json().await?)
+    let resp = client
+        .get(&url)
+        .headers(headers)
+        .send()
+        .await
+        .with_context(|| format!("bing speech: voice list request failed for {url}"))?;
+
+    let status = resp.status();
+    let resp = resp
+        .error_for_status()
+        .with_context(|| format!("bing speech: voice list returned {status}"))?;
+    debug!(
+        status = status.as_u16(),
+        "bing speech: voice list response received"
+    );
+
+    let voices: Vec<Voice> = resp.json().await.with_context(|| {
+        format!("bing speech: voice list response is not valid json ({status})")
+    })?;
+
+    if voices.is_empty() {
+        warn!("bing speech: voice list is empty");
+    }
+    debug!(
+        voices = voices.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "bing speech: voice list ready"
+    );
+
+    Ok(voices)
 }
 
 fn create_empty_wav() -> Result<Vec<u8>> {
@@ -115,58 +147,159 @@ pub async fn get_audio_bytes(
     locale: &str,
     volume: f32,
 ) -> Result<Vec<u8>> {
+    let started = Instant::now();
     let parts = crate::tts::split_long_text(text, BING_SPEECH_MAX_CHARS);
+
+    debug!(
+        voice,
+        locale,
+        volume,
+        text_chars = text.chars().count(),
+        text = preview(text),
+        parts = parts.len(),
+        "bing speech: synthesis requested"
+    );
 
     let futures: Vec<_> = parts
         .into_iter()
-        .map(|part| fetch_audio_part(part, voice.to_string(), locale.to_string()))
+        .enumerate()
+        .map(|(index, part)| {
+            let voice = voice.to_string();
+            let locale = locale.to_string();
+            async move {
+                let part_started = Instant::now();
+                let text = preview(&part);
+                let chars = part.chars().count();
+
+                debug!(index, chars, text, "bing speech: fetching part");
+
+                let result = fetch_audio_part(part, voice, locale).await;
+                match &result {
+                    Ok(audio) => debug!(
+                        index,
+                        chars,
+                        text,
+                        mp3_bytes = audio.len(),
+                        elapsed_ms = part_started.elapsed().as_millis(),
+                        "bing speech: part received"
+                    ),
+                    Err(error) => warn!(
+                        index,
+                        chars,
+                        text,
+                        elapsed_ms = part_started.elapsed().as_millis(),
+                        error = ?error,
+                        "bing speech: part failed"
+                    ),
+                }
+                result
+            }
+        })
         .collect();
 
     let results = futures::future::join_all(futures).await;
 
     let mut combined_audio = Vec::new();
-    for audio in results.into_iter().flatten() {
-        combined_audio.extend(audio);
+    let mut failed_parts = 0;
+    for result in results {
+        match result {
+            Ok(audio) => combined_audio.extend(audio),
+            Err(_) => failed_parts += 1,
+        }
     }
 
-    if combined_audio.is_empty() {
-        return create_empty_wav();
+    let mp3_bytes = combined_audio.len();
+    if mp3_bytes == 0 {
+        warn!(
+            failed_parts,
+            elapsed_ms = started.elapsed().as_millis(),
+            "bing speech: no audio received, falling back to an empty wav"
+        );
+        return create_empty_wav().context("bing speech: failed to build the empty wav");
     }
 
-    crate::tts::convert_mp3_to_wav(combined_audio, volume)
+    debug!(
+        failed_parts,
+        mp3_bytes, "bing speech: converting mp3 to wav"
+    );
+
+    let wav = crate::tts::convert_mp3_to_wav(combined_audio, volume)
+        .context("bing speech: failed to convert the mp3 stream to wav")?;
+
+    debug!(
+        mp3_bytes,
+        wav_bytes = wav.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "bing speech: synthesis done"
+    );
+
+    Ok(wav)
 }
 
 async fn fetch_audio_part(part: String, voice: String, locale: String) -> Result<Vec<u8>> {
+    let started = Instant::now();
+    let text = preview(&part);
+
     let url = Url::parse(&format!(
         "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken={}&Sec-MS-GEC={}&Sec-MS-GEC-Version={}",
         TRUSTED_CLIENT_TOKEN,
         generate_sec_ms_gec(),
         SEC_MS_GEC_VERSION
-    ))?;
+    ))
+    .context("bing speech: failed to build the websocket url")?;
 
-    let mut request = url.to_string().into_client_request().unwrap();
+    debug!(
+        url = url.as_str(),
+        voice, locale, text, "bing speech: connecting"
+    );
+
+    let mut request = url
+        .to_string()
+        .into_client_request()
+        .context("bing speech: failed to build the websocket request")?;
     edgenize(request.headers_mut());
 
-    let (mut ws_stream, _) = connect_async(request).await?;
+    let (mut ws_stream, response) = connect_async(request)
+        .await
+        .with_context(|| format!("bing speech: websocket handshake failed for {url}"))?;
+    debug!(
+        status = response.status().as_u16(),
+        headers = ?response.headers(),
+        "bing speech: websocket connected"
+    );
+
+    let config = "Content-Type:application/json; charset=utf-8\r\n\
+            Path:speech.config\r\n\r\n\
+            {\"context\":{\"synthesis\":{\"audio\":{\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}";
+    debug!(payload = config, "bing speech: sending speech.config");
 
     ws_stream
-        .send(Message::Text(
-            "Content-Type:application/json; charset=utf-8\r\n\
-            Path:speech.config\r\n\r\n\
-            {\"context\":{\"synthesis\":{\"audio\":{\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}"
-            .to_string().into(),
-        ))
-        .await?;
+        .send(Message::Text(config.to_string().into()))
+        .await
+        .context("bing speech: failed to send speech.config")?;
 
     let locale_regex = regex::Regex::new(r"^[a-z]{2}-[A-Z]{2}$").unwrap();
     let locale_option = if locale_regex.is_match(&locale) {
         Some(locale.as_str())
     } else {
+        debug!(
+            locale,
+            "bing speech: locale is not a valid tag, omitting xml:lang"
+        );
         None
     };
 
     let doc = ssml::speak(locale_option, [ssml::voice(&voice, [part])]);
-    let ssml_string = doc.serialize_to_string(&ssml::SerializeOptions::default())?;
+    let ssml_string = doc
+        .serialize_to_string(&ssml::SerializeOptions::default())
+        .context("bing speech: failed to serialize the ssml document")?;
+
+    let request_id = Uuid::new_v4().simple();
+    debug!(
+        request_id = request_id.to_string(),
+        ssml = preview(&ssml_string),
+        "bing speech: sending ssml"
+    );
 
     ws_stream
         .send(Message::Text(
@@ -175,30 +308,107 @@ async fn fetch_audio_part(part: String, voice: String, locale: String) -> Result
             Content-Type:application/ssml+xml\r\n\
             Path:ssml\r\n\r\n\
             {}",
-                Uuid::new_v4().simple(),
-                ssml_string
+                request_id, ssml_string
             )
             .into(),
         ))
-        .await?;
+        .await
+        .context("bing speech: failed to send ssml")?;
 
     let mut audio_data = Vec::new();
+    let mut messages = 0;
+    let mut audio_messages = 0;
+    let mut turn_ended = false;
 
-    while let Some(msg) = ws_stream.next().await {
-        match msg? {
-            Message::Text(text) if text.contains("Path:turn.end") => break,
-            Message::Binary(data) if data.len() >= 2 => {
-                let header_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-                if data.len() >= header_len + 2 {
-                    let headers = String::from_utf8_lossy(&data[2..2 + header_len]);
-                    if headers.contains("Path:audio") && headers.contains("Content-Type:audio/mpeg")
-                    {
-                        audio_data.extend_from_slice(&data[2 + header_len..]);
-                    }
+    while let Some(message) = ws_stream.next().await {
+        let message = message.context("bing speech: failed to receive a websocket message")?;
+        messages += 1;
+
+        match message {
+            Message::Text(payload) => {
+                debug!(
+                    messages,
+                    payload = preview(&payload),
+                    "bing speech: text message"
+                );
+                if payload.contains("Path:turn.end") {
+                    turn_ended = true;
+                    break;
                 }
             }
-            _ => {}
+            Message::Binary(data) => {
+                debug!(messages, bytes = data.len(), "bing speech: binary message");
+
+                if data.len() < 2 {
+                    warn!(
+                        messages,
+                        bytes = data.len(),
+                        "bing speech: binary message is too short"
+                    );
+                    continue;
+                }
+
+                let header_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                if data.len() < header_len + 2 {
+                    warn!(
+                        messages,
+                        bytes = data.len(),
+                        header_len,
+                        "bing speech: binary message is shorter than its header"
+                    );
+                    continue;
+                }
+
+                let headers = String::from_utf8_lossy(&data[2..2 + header_len]).to_string();
+                if headers.contains("Path:audio") && headers.contains("Content-Type:audio/mpeg") {
+                    let chunk = &data[2 + header_len..];
+                    audio_messages += 1;
+                    audio_data.extend_from_slice(chunk);
+                    debug!(
+                        messages,
+                        chunk_bytes = chunk.len(),
+                        mp3_bytes = audio_data.len(),
+                        "bing speech: audio chunk"
+                    );
+                } else {
+                    debug!(
+                        messages,
+                        headers = preview(&headers),
+                        "bing speech: skipped binary message"
+                    );
+                }
+            }
+            Message::Close(frame) => {
+                debug!(messages, frame = ?frame, "bing speech: websocket closed");
+                break;
+            }
+            other => debug!(messages, message = ?other, "bing speech: other message"),
         }
+    }
+
+    if !turn_ended {
+        warn!(
+            messages,
+            audio_messages,
+            mp3_bytes = audio_data.len(),
+            "bing speech: stream ended without Path:turn.end"
+        );
+    }
+
+    if audio_data.is_empty() {
+        warn!(
+            messages,
+            elapsed_ms = started.elapsed().as_millis(),
+            "bing speech: no audio bytes received"
+        );
+    } else {
+        debug!(
+            messages,
+            audio_messages,
+            mp3_bytes = audio_data.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "bing speech: stream done"
+        );
     }
 
     Ok(audio_data)

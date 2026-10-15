@@ -17,15 +17,19 @@ regex = "1"
 reqwest = { version = "0.13", features = ["rustls", "json", "http2"], default-features = false }
 rubato = "5"
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.11"
 ssml = "0.2"
 structstruck = "0.5"
 symphonia = { version = "0.6", features = ["mp3", "pcm"], default-features = false }
 tap = "1"
 tokio = { version = "1", features = ["sync"] }
-tokio-tungstenite = "0.30"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 toml = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
 tungstenite = "0.30"
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

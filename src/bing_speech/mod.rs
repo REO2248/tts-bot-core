@@ -1,12 +1,15 @@
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
+use tracing::debug;
 
 use crate::tts::{CharacterView, StyleView, TtsService};
 
 mod bing_speech_tts;
+mod sec_ms_gec;
 use bing_speech_tts::{get_audio_bytes, list_voices};
 
 fn default_master_volume() -> f32 {
@@ -86,14 +89,42 @@ fn parse_friendly_name(friendly_name: &str) -> String {
 #[async_trait]
 impl TtsService for BingSpeech {
     async fn tts(&self, style_id: &str, text: &str) -> Result<Vec<u8>> {
+        let started = Instant::now();
         let (locale, voice) = style_id
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("Invalid style_id format: {style_id}"))?;
-        get_audio_bytes(text, voice, locale, self.inner.master_volume).await
+
+        debug!(
+            style_id,
+            voice,
+            locale,
+            volume = self.inner.master_volume,
+            text_chars = text.chars().count(),
+            "bing speech: tts request"
+        );
+
+        let audio = get_audio_bytes(text, voice, locale, self.inner.master_volume)
+            .await
+            .with_context(|| format!("bing speech: tts failed for {style_id}"))?;
+
+        debug!(
+            style_id,
+            wav_bytes = audio.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "bing speech: tts response"
+        );
+
+        Ok(audio)
     }
 
     async fn styles(&self) -> Result<Vec<CharacterView>> {
-        let voices = list_voices().await?;
+        let started = Instant::now();
+        let languages = self.inner.languages.len();
+        debug!(languages, "bing speech: listing styles");
+
+        let voices = list_voices()
+            .await
+            .context("bing speech: failed to list voices")?;
 
         let mut characters = Vec::new();
 
@@ -115,8 +146,19 @@ impl TtsService for BingSpeech {
                     policy: "Microsoft Services Agreement".to_string(),
                     styles,
                 });
+            } else {
+                debug!(
+                    language = language.code,
+                    "bing speech: no voices for the language"
+                );
             }
         }
+
+        debug!(
+            characters = characters.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "bing speech: styles ready"
+        );
 
         Ok(characters)
     }
