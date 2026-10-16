@@ -12,6 +12,7 @@ pub mod voiceroid;
 pub mod voicevox;
 pub mod volcengine;
 pub mod winrttts;
+pub mod simple_tts;
 
 pub mod model;
 pub mod timestretch;

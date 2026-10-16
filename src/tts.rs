@@ -17,6 +17,7 @@ use crate::model::TtsServiceConfig;
 use crate::naver::Naver;
 use crate::omnivoice::OmniVoice;
 use crate::sayserver::SayServer;
+use crate::simple_tts::SimpleTts;
 use crate::voiceroid::Voiceroid;
 use crate::voicevox::Voicevox;
 use crate::volcengine::Volcengine;
@@ -393,6 +394,15 @@ impl TtsServices {
                         service_id,
                         Box::new(Volcengine::new(config).with_context(|| {
                             format!("Failed to initialize Volcengine backend ({service_id})")
+                        })?),
+                    )
+                    .await
+                }
+                TtsServiceConfig::SimpleTts(config) => {
+                    self.register(
+                        service_id,
+                        Box::new(SimpleTts::new(config).with_context(|| {
+                            format!("Failed to initialize SimpleTts backend ({service_id})")
                         })?),
                     )
                     .await

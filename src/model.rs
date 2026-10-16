@@ -21,6 +21,7 @@ pub enum TtsServiceConfig {
     OmniVoice(crate::omnivoice::Setting),
     SayServer(crate::sayserver::Setting),
     Volcengine(crate::volcengine::Setting),
+    SimpleTts(crate::simple_tts::Setting),
 }
 
 #[derive(Deserialize, Debug)]
