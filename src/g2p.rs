@@ -121,6 +121,28 @@ pub(crate) fn matching<'a>(
         .collect()
 }
 
+/// 保存された選択がその service / speaker / style で使えるならそれを、
+/// 使えない場合は設定順で最初にマッチするエンジンを返す。
+/// 未選択のとき、およびマッチするエンジンがないときは None。
+pub(crate) fn resolve<'a>(
+    engines: &'a IndexMap<String, Engine>,
+    saved: Option<&str>,
+    service: &str,
+    speaker: &str,
+    style: &str,
+) -> Option<&'a Engine> {
+    // 未選択のときはフォールバックしない。
+    let saved = saved?;
+
+    match engines.get(saved) {
+        Some(engine) if engine.matches(service, speaker, style) => Some(engine),
+        _ => matching(engines, service, speaker, style)
+            .into_iter()
+            .next()
+            .map(|(_, engine)| engine),
+    }
+}
+
 #[derive(Serialize)]
 struct G2pRequest<'a> {
     text: &'a str,
@@ -135,7 +157,7 @@ struct G2pResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, Setting, Target, matching};
+    use super::{Engine, Setting, Target, matching, resolve};
 
     fn setting(friendly_name: &str, targets: Vec<Target>) -> Setting {
         Setting {
@@ -235,6 +257,49 @@ mod tests {
     fn endpoint_is_api_g2p() {
         let engine = engine("G2P", vec![]);
         assert_eq!(engine.endpoint.as_str(), "https://example.test/api/g2p");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_first_match() {
+        let chongbong = || target(Some("chongbong"), Some("Default"), Some("Default"));
+        let mut engines = indexmap::IndexMap::new();
+        engines.insert("a".to_string(), engine("A", vec![chongbong()]));
+        engines.insert("b".to_string(), engine("B", vec![chongbong()]));
+
+        // 保存値が有効ならそのエンジン。
+        let resolved = resolve(&engines, Some("b"), "chongbong", "Default", "Default").unwrap();
+        assert_eq!(resolved.friendly_name, "B");
+
+        // 存在しないエンジン名 → 最初のマッチ。
+        let resolved = resolve(&engines, Some("gone"), "chongbong", "Default", "Default").unwrap();
+        assert_eq!(resolved.friendly_name, "A");
+
+        // 保存値が現在の service / speaker / style に一致しない → 最初のマッチ。
+        let mut engines = engines;
+        engines.insert(
+            "c".to_string(),
+            engine("C", vec![target(Some("mirae"), None, None)]),
+        );
+        let resolved = resolve(&engines, Some("c"), "chongbong", "Default", "Default").unwrap();
+        assert_eq!(resolved.friendly_name, "A");
+    }
+
+    #[test]
+    fn resolve_keeps_unselected_and_unmatched_plain() {
+        let engines = indexmap::IndexMap::from([(
+            "a".to_string(),
+            engine(
+                "A",
+                vec![target(Some("chongbong"), Some("Default"), Some("Default"))],
+            ),
+        )]);
+
+        // 未選択はフォールバックしない。
+        assert!(resolve(&engines, None, "chongbong", "Default", "Default").is_none());
+
+        // マッチするエンジンがないスタイル。
+        assert!(resolve(&engines, Some("a"), "voicevox", "x", "y").is_none());
+        assert!(resolve(&engines, None, "voicevox", "x", "y").is_none());
     }
 
     #[test]

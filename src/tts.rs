@@ -484,22 +484,16 @@ impl TtsServices {
         g2p: Option<&str>,
         text: &str,
     ) -> Result<String> {
-        let Some(id) = g2p else {
+        let Some(speaker) = self.speaker_name(service_id, style_id).await else {
             return Ok(text.to_string());
         };
         let engine = {
             let engines = self.inner.g2p.read().await;
-            engines
-                .get(id)
-                .with_context(|| format!("Unknown G2P engine {id}"))?
-                .clone()
+            crate::g2p::resolve(&engines, g2p, service_id, &speaker, style_id).cloned()
         };
-        let Some(speaker) = self.speaker_name(service_id, style_id).await else {
+        let Some(engine) = engine else {
             return Ok(text.to_string());
         };
-        if !engine.matches(service_id, &speaker, style_id) {
-            return Ok(text.to_string());
-        }
         engine.convert(text).await
     }
 }
